@@ -6,7 +6,7 @@
 
 **Menu bar recording · Native SpeechAnalyzer · Daily transcript files · Local first**
 
-### [Download VoiceShot.dmg →](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
+### [Download VoiceShot.dmg →](https://github.com/qteqpid/voice-shot/blob/master/releases/latest/download/VoiceShot.dmg)
 
 [![Download](https://img.shields.io/badge/Download-VoiceShot.dmg-2ea44f.svg)](https://github.com/qteqpid/voice-shot/tree/master/releases/latest/download/VoiceShot.dmg)
 [![macOS](https://img.shields.io/badge/macOS-26%2B-blue.svg)](#platform-support)
@@ -24,14 +24,9 @@
 Download the latest installer:
 
 ```text
-https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg
+https://github.com/qteqpid/voice-shot/blob/master/releases/latest/download/VoiceShot.dmg
 ```
 
-If the direct asset link is not available yet, open the latest GitHub Release and download `VoiceShot.dmg` from the release assets:
-
-```text
-https://github.com/qteqpid/voice-shot/releases/latest
-```
 
 ### 2. Install VoiceShot
 
