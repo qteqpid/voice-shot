@@ -8,7 +8,7 @@
 
 ### [Download VoiceShot.dmg →](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
 
-[![Download](https://img.shields.io/badge/Download-VoiceShot.dmg-2ea44f.svg)](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
+[![Download](https://img.shields.io/badge/Download-VoiceShot.dmg-2ea44f.svg)](https://github.com/qteqpid/voice-shot/tree/master/releases/latest/download/VoiceShot.dmg)
 [![macOS](https://img.shields.io/badge/macOS-26%2B-blue.svg)](#platform-support)
 [![Swift](https://img.shields.io/badge/Swift-6.2%2B-orange.svg)](#build-from-source)
 [![Speech](https://img.shields.io/badge/Speech-SpeechAnalyzer-blueviolet.svg)](#features)
