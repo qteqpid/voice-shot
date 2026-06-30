@@ -4,11 +4,11 @@
 
 ### Timestamped speech notes for macOS
 
-**Menu bar recording · Native SpeechAnalyzer · Daily transcript files · Local first**
+**Menu bar recording · Native SpeechAnalyzer · Per-session transcript files · Local first**
 
-### [Download VoiceShot.dmg →](https://github.com/qteqpid/voice-shot/blob/master/releases/latest/download/VoiceShot.dmg)
+### [Download VoiceShot.dmg →](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
 
-[![Download](https://img.shields.io/badge/Download-VoiceShot.dmg-2ea44f.svg)](https://github.com/qteqpid/voice-shot/tree/master/releases/latest/download/VoiceShot.dmg)
+[![Download](https://img.shields.io/badge/Download-VoiceShot.dmg-2ea44f.svg)](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
 [![macOS](https://img.shields.io/badge/macOS-26%2B-blue.svg)](#platform-support)
 [![Swift](https://img.shields.io/badge/Swift-6.2%2B-orange.svg)](#build-from-source)
 [![Speech](https://img.shields.io/badge/Speech-SpeechAnalyzer-blueviolet.svg)](#features)
@@ -24,7 +24,7 @@
 Download the latest installer:
 
 ```text
-https://github.com/qteqpid/voice-shot/blob/master/releases/latest/download/VoiceShot.dmg
+https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg
 ```
 
 
@@ -71,8 +71,8 @@ Example output:
 | **Menu bar recording** | Start and stop recording from the macOS menu bar |
 | **Native transcription** | Uses macOS 26 `SpeechAnalyzer` and `SpeechTranscriber` |
 | **Timestamped text** | Adds an `HH:mm` prefix based on the speech segment start time |
-| **Daily transcript files** | Writes each day to `transcript-yyyyMMdd.txt` |
-| **Structured events** | Also writes recognition events to `events.jsonl` |
+| **Per-session transcript files** | Writes one transcript per recording, named `transcript-yyyyMMdd-HHmmss.txt` |
+| **Editable live transcript** | Edit the floating transcript window before stopping the recording |
 | **Language setting** | Choose the speech recognition language in Settings |
 | **Local storage** | Files are saved locally on your Mac |
 | **Minimal permissions** | Uses microphone and speech recognition only |
@@ -123,17 +123,15 @@ Generated files:
 
 ```text
 VoiceShot/
-  transcript-20260630.txt
-  transcript-20260701.txt
-  events.jsonl
+  transcript-20260630-132045.txt
+  transcript-20260630-141812.txt
 ```
 
 | File | Purpose |
 |---|---|
-| `transcript-yyyyMMdd.txt` | Human-readable daily transcript |
-| `events.jsonl` | Structured event log for later search, indexing, or analysis |
+| `transcript-yyyyMMdd-HHmmss.txt` | Human-readable transcript for one recording session |
 
-Transcription may appear with a short delay because VoiceShot writes finalized speech recognition segments. Stopping the recording flushes the remaining text.
+Transcription may appear with a short delay because VoiceShot displays finalized speech recognition segments. VoiceShot writes the transcript file when you stop recording, using the text currently shown in the editable transcript window.
 
 ## Settings
 

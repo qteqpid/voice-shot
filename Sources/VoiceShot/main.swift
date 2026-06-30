@@ -61,60 +61,19 @@ enum PermissionManager {
     }
 }
 
-struct TranscriptEvent: Codable, Sendable {
-    let type: String
-    let timestamp: Date
-    let startedAt: Date
-    let text: String
-}
-
-final class JSONLWriter {
-    private let fileURL: URL
-    private let queue = DispatchQueue(label: "voiceshot.jsonl", qos: .utility)
-    private let encoder: JSONEncoder
+final class TranscriptWriter {
+    private let saveURL: URL
+    private let fileNameFormatter: DateFormatter
 
     init(saveURL: URL) throws {
         try FileManager.default.createDirectory(at: saveURL, withIntermediateDirectories: true)
-        fileURL = saveURL.appendingPathComponent("events.jsonl")
-        encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-    }
-
-    func append<T: Encodable & Sendable>(_ value: T) {
-        queue.async { [fileURL, encoder] in
-            guard var data = try? encoder.encode(value) else { return }
-            data.append(0x0A)
-
-            if FileManager.default.fileExists(atPath: fileURL.path),
-               let handle = try? FileHandle(forWritingTo: fileURL) {
-                defer { try? handle.close() }
-                _ = try? handle.seekToEnd()
-                _ = try? handle.write(contentsOf: data)
-            } else {
-                try? data.write(to: fileURL)
-            }
-        }
-    }
-}
-
-final class TranscriptWriter {
-    private let saveURL: URL
-    private let timeFormatter: DateFormatter
-    private let dateFormatter: DateFormatter
-    private let jsonlWriter: JSONLWriter
-
-    init(saveURL: URL, jsonlWriter: JSONLWriter) throws {
-        try FileManager.default.createDirectory(at: saveURL, withIntermediateDirectories: true)
         self.saveURL = saveURL
-        self.jsonlWriter = jsonlWriter
-        timeFormatter = DateFormatter()
-        timeFormatter.dateFormat = "HH:mm"
-        dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyyMMdd"
+        fileNameFormatter = DateFormatter()
+        fileNameFormatter.dateFormat = "yyyyMMdd-HHmmss"
     }
 
-    private func transcriptURL(for date: Date) -> URL {
-        saveURL.appendingPathComponent("transcript-\(dateFormatter.string(from: date)).txt")
+    private func transcriptURL(for sessionStartedAt: Date) -> URL {
+        saveURL.appendingPathComponent("transcript-\(fileNameFormatter.string(from: sessionStartedAt)).txt")
     }
 
     private func ensureFileExists(at fileURL: URL) {
@@ -123,26 +82,16 @@ final class TranscriptWriter {
         }
     }
 
-    func append(startedAt: Date, text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        let fileURL = transcriptURL(for: startedAt)
+    func saveTranscript(for sessionStartedAt: Date, text: String) throws -> URL {
+        let fileURL = transcriptURL(for: sessionStartedAt)
         ensureFileExists(at: fileURL)
 
-        let line = "\(timeFormatter.string(from: startedAt)) \(trimmed)\n"
-        if let data = line.data(using: .utf8), let handle = try? FileHandle(forWritingTo: fileURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            _ = try? handle.write(contentsOf: data)
+        var normalized = text
+        if !normalized.isEmpty && !normalized.hasSuffix("\n") {
+            normalized.append("\n")
         }
-
-        jsonlWriter.append(TranscriptEvent(
-            type: "transcript",
-            timestamp: Date(),
-            startedAt: startedAt,
-            text: trimmed
-        ))
+        try normalized.write(to: fileURL, atomically: true, encoding: .utf8)
+        return fileURL
     }
 }
 
@@ -471,10 +420,10 @@ extension CMSampleBuffer {
 final class RecordingSession {
     private let transcriptWriter: TranscriptWriter
     private let transcriber = NativeSpeechTranscriber()
+    private let startedAt = Date()
 
     init(saveURL: URL) throws {
-        let jsonlWriter = try JSONLWriter(saveURL: saveURL)
-        transcriptWriter = try TranscriptWriter(saveURL: saveURL, jsonlWriter: jsonlWriter)
+        transcriptWriter = try TranscriptWriter(saveURL: saveURL)
     }
 
     func start(
@@ -487,18 +436,22 @@ final class RecordingSession {
             onVoiceActivity: { startedAt in
                 onVoiceActivity?(startedAt)
             },
-            onText: { [weak self] startedAt, text, isFinal in
-            if isFinal {
-                self?.transcriptWriter.append(startedAt: startedAt, text: text)
-                onFinalText?(startedAt, text)
-            } else {
-                onPartialText?(startedAt, text)
+            onText: { startedAt, text, isFinal in
+                if isFinal {
+                    onFinalText?(startedAt, text)
+                } else {
+                    onPartialText?(startedAt, text)
+                }
             }
-        })
+        )
     }
 
     func stop() async {
         await transcriber.stop()
+    }
+
+    func saveTranscript(_ text: String) throws -> URL {
+        try transcriptWriter.saveTranscript(for: startedAt, text: text)
     }
 }
 
@@ -517,7 +470,7 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
 
         let panel = NSPanel(
             contentRect: AppSettings.transcriptPanelFrame ?? NSRect(x: 0, y: 0, width: 520, height: 260),
-            styleMask: [.titled, .resizable, .nonactivatingPanel],
+            styleMask: [.titled, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -580,6 +533,11 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
         super.close()
     }
 
+    func transcriptTextForSaving() -> String {
+        removePendingIfNeeded()
+        return textView.string
+    }
+
     func windowDidMove(_ notification: Notification) {
         saveFrame()
     }
@@ -600,7 +558,7 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
 
-        textView.isEditable = false
+        textView.isEditable = true
         textView.isSelectable = true
         textView.drawsBackground = false
         textView.textContainerInset = NSSize(width: 14, height: 12)
@@ -897,12 +855,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             do {
+                let session = try RecordingSession(saveURL: AppSettings.saveURL)
                 let overlay = TranscriptOverlayController()
                 overlay.clear()
                 overlay.show(near: statusItem)
                 transcriptOverlay = overlay
 
-                let session = try RecordingSession(saveURL: AppSettings.saveURL)
                 try await session.start(
                     onVoiceActivity: { [weak overlay] startedAt in
                         overlay?.showPending(startedAt: startedAt)
@@ -928,13 +886,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func finish() {
         guard let recordingSession else { return }
+        let overlay = transcriptOverlay
         Task {
             await recordingSession.stop()
+            let transcriptText = overlay?.transcriptTextForSaving() ?? ""
+            do {
+                let fileURL = try recordingSession.saveTranscript(transcriptText)
+                updateStatusMessage(title: "VoiceShot finished", message: "Saved to \(fileURL.path)")
+            } catch {
+                showAlert(title: "Save failed", message: error.localizedDescription)
+            }
             self.recordingSession = nil
             transcriptOverlay?.close()
             transcriptOverlay = nil
             isRunning = false
-            updateStatusMessage(title: "VoiceShot finished", message: "Saved to \(AppSettings.saveURL.path)")
             buildMenu()
         }
     }
