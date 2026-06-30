@@ -6,6 +6,9 @@
 
 **Menu bar recording · Native SpeechAnalyzer · Daily transcript files · Local first**
 
+### [Download VoiceShot.dmg →](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
+
+[![Download](https://img.shields.io/badge/Download-VoiceShot.dmg-2ea44f.svg)](https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg)
 [![macOS](https://img.shields.io/badge/macOS-26%2B-blue.svg)](#platform-support)
 [![Swift](https://img.shields.io/badge/Swift-6.2%2B-orange.svg)](#build-from-source)
 [![Speech](https://img.shields.io/badge/Speech-SpeechAnalyzer-blueviolet.svg)](#features)
@@ -16,27 +19,31 @@
 
 ## Quick Start
 
-### 1. Build the app
+### 1. Download the DMG
 
-```bash
-./scripts/build-app.sh
+Download the latest installer:
+
+```text
+https://github.com/qteqpid/voice-shot/releases/latest/download/VoiceShot.dmg
 ```
 
-For a temporary unsigned development build:
+If the direct asset link is not available yet, open the latest GitHub Release and download `VoiceShot.dmg` from the release assets:
 
-```bash
-ALLOW_UNSIGNED=1 ./scripts/build-app.sh
+```text
+https://github.com/qteqpid/voice-shot/releases/latest
 ```
 
-### 2. Open VoiceShot
+### 2. Install VoiceShot
 
-```bash
-open dist/VoiceShot.app
-```
+Open `VoiceShot.dmg`, then drag `VoiceShot.app` into `Applications`.
 
-VoiceShot runs in the macOS menu bar. Click the microphone icon to start or stop recording.
+### 3. Launch VoiceShot
 
-### 3. Grant permissions
+Open `VoiceShot` from `Applications`. The app runs in the macOS menu bar.
+
+Click the microphone icon in the menu bar to start or stop recording.
+
+### 4. Grant permissions
 
 On first launch, macOS asks for:
 
@@ -87,6 +94,27 @@ Click the VoiceShot microphone icon in the menu bar:
 | `Quit` | Exit VoiceShot |
 
 While recording, the menu bar icon changes to a compact recording indicator.
+
+## Install Notes
+
+VoiceShot is distributed as a macOS DMG installer:
+
+```text
+VoiceShot.dmg
+```
+
+The DMG contains:
+
+| Item | Purpose |
+|---|---|
+| `VoiceShot.app` | The menu bar app |
+| `Applications` | Shortcut target for drag-and-drop installation |
+
+For normal use, install the app into:
+
+```text
+/Applications/VoiceShot.app
+```
 
 ## Output Files
 
@@ -169,9 +197,21 @@ Build a `.app` bundle:
 open dist/VoiceShot.app
 ```
 
+Build a DMG installer:
+
+```bash
+./scripts/package-dmg.sh
+```
+
+For a temporary unsigned local DMG:
+
+```bash
+ALLOW_UNSIGNED=1 ./scripts/package-dmg.sh
+```
+
 ### Code Signing
 
-`build-app.sh` tries to find an Apple code signing identity automatically.
+`build-app.sh` tries to find an Apple code signing identity automatically for local app builds.
 
 It prefers:
 
@@ -191,6 +231,20 @@ ALLOW_UNSIGNED=1 ./scripts/build-app.sh
 ```
 
 Unsigned builds are useful for development, but macOS privacy permissions may need to be granted again after rebuilds.
+
+For release DMG packaging, `package-dmg.sh` looks for a local `Developer ID Application` certificate automatically. If exactly one certificate is found in your keychain, the script uses it. If none or multiple are found, it prints the next action.
+
+You can also set the identity explicitly:
+
+```bash
+SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/package-dmg.sh
+```
+
+If you have a notarization profile configured:
+
+```bash
+NOTARY_PROFILE="your-notary-profile" ./scripts/package-dmg.sh
+```
 
 ## Troubleshooting
 
@@ -215,10 +269,10 @@ Make sure the selected language is supported by macOS speech recognition on your
 ## Uninstall
 
 1. Quit `VoiceShot` from the menu bar.
-2. Delete the app bundle:
+2. Delete the installed app:
 
    ```text
-   dist/VoiceShot.app
+   /Applications/VoiceShot.app
    ```
 
 3. Delete local transcripts if needed:
