@@ -7,6 +7,7 @@ struct AppSettings {
     private enum Key {
         static let language = "language"
         static let savePath = "savePath"
+        static let transcriptPanelFrame = "transcriptPanelFrame"
     }
 
     static var language: String {
@@ -25,6 +26,21 @@ struct AppSettings {
             return documents.appendingPathComponent("VoiceShot")
         }
         set { UserDefaults.standard.set(newValue.path, forKey: Key.savePath) }
+    }
+
+    static var transcriptPanelFrame: NSRect? {
+        get {
+            let frameString = UserDefaults.standard.string(forKey: Key.transcriptPanelFrame) ?? ""
+            guard !frameString.isEmpty else { return nil }
+            return NSRectFromString(frameString)
+        }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(NSStringFromRect(newValue), forKey: Key.transcriptPanelFrame)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Key.transcriptPanelFrame)
+            }
+        }
     }
 }
 
@@ -382,14 +398,137 @@ final class RecordingSession {
         transcriptWriter = try TranscriptWriter(saveURL: saveURL, jsonlWriter: jsonlWriter)
     }
 
-    func start() async throws {
+    func start(onText: ((Date, String) -> Void)? = nil) async throws {
         try await transcriber.start(language: AppSettings.language) { [weak self] startedAt, text in
             self?.transcriptWriter.append(startedAt: startedAt, text: text)
+            onText?(startedAt, text)
         }
     }
 
     func stop() async {
         await transcriber.stop()
+    }
+}
+
+@MainActor
+final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
+    private let textView = NSTextView()
+    private let scrollView = NSScrollView()
+    private let timeFormatter: DateFormatter
+
+    init() {
+        timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "HH:mm"
+
+        let panel = NSPanel(
+            contentRect: AppSettings.transcriptPanelFrame ?? NSRect(x: 0, y: 0, width: 520, height: 260),
+            styleMask: [.titled, .resizable, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "VoiceShot Transcript"
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.minSize = NSSize(width: 360, height: 180)
+
+        super.init(window: panel)
+        panel.delegate = self
+        buildUI()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func show(near statusItem: NSStatusItem?) {
+        if AppSettings.transcriptPanelFrame == nil {
+            positionBelowMenuBar(near: statusItem)
+        }
+        window?.orderFrontRegardless()
+    }
+
+    func append(startedAt: Date, text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let line = "\(timeFormatter.string(from: startedAt)) \(trimmed)\n"
+        textView.textStorage?.append(NSAttributedString(string: line, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+            .foregroundColor: NSColor.labelColor
+        ]))
+        textView.scrollToEndOfDocument(nil)
+    }
+
+    func clear() {
+        textView.string = ""
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        saveFrame()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        saveFrame()
+    }
+
+    private func buildUI() {
+        guard let contentView = window?.contentView else { return }
+
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 14, height: 12)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        textView.autoresizingMask = [.width]
+        textView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        textView.textColor = .labelColor
+        textView.string = ""
+
+        scrollView.documentView = textView
+        contentView.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+        ])
+    }
+
+    private func positionBelowMenuBar(near statusItem: NSStatusItem?) {
+        guard let window else { return }
+
+        let screen = statusItem?.button?.window?.screen ?? NSScreen.main
+        guard let visibleFrame = screen?.visibleFrame else {
+            window.center()
+            return
+        }
+
+        var frame = window.frame
+        let buttonFrame = statusItem?.button?.window?.convertToScreen(statusItem?.button?.frame ?? .zero)
+        let preferredMidX = buttonFrame?.midX ?? visibleFrame.midX
+        frame.origin.x = min(max(preferredMidX - frame.width / 2, visibleFrame.minX + 12), visibleFrame.maxX - frame.width - 12)
+        frame.origin.y = visibleFrame.maxY - frame.height - 12
+        window.setFrame(frame, display: true)
+    }
+
+    private func saveFrame() {
+        guard let frame = window?.frame else { return }
+        AppSettings.transcriptPanelFrame = frame
     }
 }
 
@@ -484,6 +623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var recordingSession: RecordingSession?
     private var settingsController: SettingsWindowController?
+    private var transcriptOverlay: TranscriptOverlayController?
     private var isRunning = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -586,13 +726,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             do {
+                let overlay = TranscriptOverlayController()
+                overlay.clear()
+                overlay.show(near: statusItem)
+                transcriptOverlay = overlay
+
                 let session = try RecordingSession(saveURL: AppSettings.saveURL)
-                try await session.start()
+                try await session.start { [weak overlay] startedAt, text in
+                    overlay?.append(startedAt: startedAt, text: text)
+                }
                 recordingSession = session
                 isRunning = true
                 updateStatusMessage(title: "VoiceShot started", message: "Recording speech")
                 buildMenu()
             } catch {
+                transcriptOverlay?.close()
+                transcriptOverlay = nil
                 showAlert(title: "Failed to start", message: error.localizedDescription)
             }
         }
@@ -603,6 +752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             await recordingSession.stop()
             self.recordingSession = nil
+            transcriptOverlay?.close()
+            transcriptOverlay = nil
             isRunning = false
             updateStatusMessage(title: "VoiceShot finished", message: "Saved to \(AppSettings.saveURL.path)")
             buildMenu()
@@ -626,6 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let recordingSession {
                 await recordingSession.stop()
             }
+            transcriptOverlay?.close()
             NSApp.terminate(nil)
         }
     }
