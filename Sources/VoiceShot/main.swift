@@ -155,9 +155,14 @@ final class NativeSpeechTranscriber {
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
     private var resultTask: Task<Void, Never>?
     private var sessionStartedAt = Date()
-    private var onText: ((Date, String) -> Void)?
+    private var onText: ((Date, String, Bool) -> Void)?
+    private var onVoiceActivity: ((Date) -> Void)?
 
-    func start(language: String, onText: @escaping (Date, String) -> Void) async throws {
+    func start(
+        language: String,
+        onVoiceActivity: @escaping (Date) -> Void,
+        onText: @escaping (Date, String, Bool) -> Void
+    ) async throws {
         await stop()
 
         guard let locale = await SpeechLocale.bestMatching(preferredIdentifier: language) else {
@@ -165,6 +170,7 @@ final class NativeSpeechTranscriber {
         }
 
         self.onText = onText
+        self.onVoiceActivity = onVoiceActivity
         sessionStartedAt = Date()
 
         let transcriber = SpeechTranscriber(
@@ -193,10 +199,11 @@ final class NativeSpeechTranscriber {
         resultTask = Task { [weak self] in
             do {
                 for try await result in transcriber.results {
-                    guard let self, result.isFinal else { continue }
+                    guard let self else { continue }
                     let text = String(result.text.characters)
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                     let offset = self.startOffset(from: result.text)
-                    self.onText?(self.sessionStartedAt.addingTimeInterval(offset), text)
+                    self.onText?(self.sessionStartedAt.addingTimeInterval(offset), text, result.isFinal)
                 }
             } catch {
                 NSLog("VoiceShot speech result stream error: \(error)")
@@ -225,6 +232,7 @@ final class NativeSpeechTranscriber {
         analyzer = nil
         transcriber = nil
         onText = nil
+        onVoiceActivity = nil
     }
 
     private func startAudioCapture(
@@ -243,7 +251,15 @@ final class NativeSpeechTranscriber {
 
         let audioOutput = AVCaptureAudioDataOutput()
         let captureQueue = DispatchQueue(label: "com.qteqpid.VoiceShot.audio-capture")
-        let delegate = AudioCaptureDelegate(inputBuilder: inputBuilder, analyzerFormat: analyzerFormat)
+        let delegate = AudioCaptureDelegate(
+            inputBuilder: inputBuilder,
+            analyzerFormat: analyzerFormat,
+            onVoiceActivity: { [weak self] startedAt in
+                Task { @MainActor [weak self] in
+                    self?.onVoiceActivity?(startedAt)
+                }
+            }
+        )
         audioOutput.setSampleBufferDelegate(delegate, queue: captureQueue)
         if session.canAddOutput(audioOutput) {
             session.addOutput(audioOutput)
@@ -309,16 +325,24 @@ enum SpeechLocale {
 final class AudioCaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     private let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
     private let analyzerFormat: AVAudioFormat
+    private let onVoiceActivity: @Sendable (Date) -> Void
     private var converter: AVAudioConverter?
+    private var lastVoiceActivityAt = Date.distantPast
 
-    init(inputBuilder: AsyncStream<AnalyzerInput>.Continuation, analyzerFormat: AVAudioFormat) {
+    init(
+        inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
+        analyzerFormat: AVAudioFormat,
+        onVoiceActivity: @escaping @Sendable (Date) -> Void
+    ) {
         self.inputBuilder = inputBuilder
         self.analyzerFormat = analyzerFormat
+        self.onVoiceActivity = onVoiceActivity
         super.init()
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pcmBuffer = sampleBuffer.toPCMBuffer() else { return }
+        notifyVoiceActivityIfNeeded(from: pcmBuffer)
 
         let outputBuffer: AVAudioPCMBuffer
         if pcmBuffer.format.sampleRate != analyzerFormat.sampleRate
@@ -337,6 +361,61 @@ final class AudioCaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBuffer
         }
 
         inputBuilder.yield(AnalyzerInput(buffer: outputBuffer))
+    }
+
+    private func notifyVoiceActivityIfNeeded(from buffer: AVAudioPCMBuffer) {
+        guard isLikelyVoiceActivity(buffer) else { return }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastVoiceActivityAt) > 0.8 else { return }
+
+        lastVoiceActivityAt = now
+        onVoiceActivity(now)
+    }
+
+    private func isLikelyVoiceActivity(_ buffer: AVAudioPCMBuffer) -> Bool {
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return false }
+
+        if let channels = buffer.floatChannelData {
+            let channelCount = max(1, Int(buffer.format.channelCount))
+            var sum: Float = 0
+            var count = 0
+
+            for channelIndex in 0..<channelCount {
+                let samples = channels[channelIndex]
+                for frameIndex in 0..<frameLength {
+                    let sample = samples[frameIndex]
+                    sum += sample * sample
+                    count += 1
+                }
+            }
+
+            guard count > 0 else { return false }
+            let rms = sqrt(sum / Float(count))
+            return rms > 0.018
+        }
+
+        if let channels = buffer.int16ChannelData {
+            let channelCount = max(1, Int(buffer.format.channelCount))
+            var sum: Float = 0
+            var count = 0
+
+            for channelIndex in 0..<channelCount {
+                let samples = channels[channelIndex]
+                for frameIndex in 0..<frameLength {
+                    let normalized = Float(samples[frameIndex]) / Float(Int16.max)
+                    sum += normalized * normalized
+                    count += 1
+                }
+            }
+
+            guard count > 0 else { return false }
+            let rms = sqrt(sum / Float(count))
+            return rms > 0.018
+        }
+
+        return false
     }
 
     private func convert(buffer: AVAudioPCMBuffer, using converter: AVAudioConverter, to targetFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
@@ -398,11 +477,24 @@ final class RecordingSession {
         transcriptWriter = try TranscriptWriter(saveURL: saveURL, jsonlWriter: jsonlWriter)
     }
 
-    func start(onText: ((Date, String) -> Void)? = nil) async throws {
-        try await transcriber.start(language: AppSettings.language) { [weak self] startedAt, text in
-            self?.transcriptWriter.append(startedAt: startedAt, text: text)
-            onText?(startedAt, text)
-        }
+    func start(
+        onVoiceActivity: ((Date) -> Void)? = nil,
+        onPartialText: ((Date, String) -> Void)? = nil,
+        onFinalText: ((Date, String) -> Void)? = nil
+    ) async throws {
+        try await transcriber.start(
+            language: AppSettings.language,
+            onVoiceActivity: { startedAt in
+                onVoiceActivity?(startedAt)
+            },
+            onText: { [weak self] startedAt, text, isFinal in
+            if isFinal {
+                self?.transcriptWriter.append(startedAt: startedAt, text: text)
+                onFinalText?(startedAt, text)
+            } else {
+                onPartialText?(startedAt, text)
+            }
+        })
     }
 
     func stop() async {
@@ -415,6 +507,9 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
     private let textView = NSTextView()
     private let scrollView = NSScrollView()
     private let timeFormatter: DateFormatter
+    private var pendingStartedAt: Date?
+    private var pendingDotCount = 0
+    private var pendingTimer: Timer?
 
     init() {
         timeFormatter = DateFormatter()
@@ -451,9 +546,20 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
         window?.orderFrontRegardless()
     }
 
+    func showPending(startedAt: Date) {
+        if pendingStartedAt == nil {
+            pendingStartedAt = startedAt
+            pendingDotCount = 0
+            appendPendingLine()
+            startPendingAnimation()
+        }
+    }
+
     func append(startedAt: Date, text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        removePendingIfNeeded()
 
         let line = "\(timeFormatter.string(from: startedAt)) \(trimmed)\n"
         textView.textStorage?.append(NSAttributedString(string: line, attributes: [
@@ -465,6 +571,13 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
 
     func clear() {
         textView.string = ""
+        stopPendingAnimation()
+        pendingStartedAt = nil
+    }
+
+    override func close() {
+        stopPendingAnimation()
+        super.close()
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -529,6 +642,64 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
     private func saveFrame() {
         guard let frame = window?.frame else { return }
         AppSettings.transcriptPanelFrame = frame
+    }
+
+    private func startPendingAnimation() {
+        pendingTimer?.invalidate()
+        pendingTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.updatePendingLine()
+            }
+        }
+        RunLoop.main.add(pendingTimer!, forMode: .common)
+    }
+
+    private func stopPendingAnimation() {
+        pendingTimer?.invalidate()
+        pendingTimer = nil
+        pendingDotCount = 0
+    }
+
+    private func updatePendingLine() {
+        guard pendingStartedAt != nil else { return }
+        pendingDotCount = (pendingDotCount % 3) + 1
+        removeLastLine()
+        appendPendingLine()
+    }
+
+    private func appendPendingLine() {
+        guard let pendingStartedAt else { return }
+
+        let dots = String(repeating: ".", count: max(1, pendingDotCount))
+        let line = "\(timeFormatter.string(from: pendingStartedAt)) \(dots)\n"
+        textView.textStorage?.append(NSAttributedString(string: line, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]))
+        textView.scrollToEndOfDocument(nil)
+    }
+
+    private func removePendingIfNeeded() {
+        guard pendingStartedAt != nil else { return }
+
+        stopPendingAnimation()
+        removeLastLine()
+        pendingStartedAt = nil
+    }
+
+    private func removeLastLine() {
+        let storage = textView.textStorage
+        let fullRange = NSRange(location: 0, length: storage?.length ?? 0)
+        guard let storage, fullRange.length > 0 else { return }
+
+        let string = storage.string as NSString
+        var searchLocation = max(0, string.length - 2)
+        while searchLocation > 0 && string.character(at: searchLocation) != 10 {
+            searchLocation -= 1
+        }
+
+        let start = string.character(at: searchLocation) == 10 ? searchLocation + 1 : 0
+        storage.deleteCharacters(in: NSRange(location: start, length: string.length - start))
     }
 }
 
@@ -732,9 +903,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 transcriptOverlay = overlay
 
                 let session = try RecordingSession(saveURL: AppSettings.saveURL)
-                try await session.start { [weak overlay] startedAt, text in
-                    overlay?.append(startedAt: startedAt, text: text)
-                }
+                try await session.start(
+                    onVoiceActivity: { [weak overlay] startedAt in
+                        overlay?.showPending(startedAt: startedAt)
+                    },
+                    onPartialText: { [weak overlay] startedAt, text in
+                        overlay?.showPending(startedAt: startedAt)
+                    },
+                    onFinalText: { [weak overlay] startedAt, text in
+                        overlay?.append(startedAt: startedAt, text: text)
+                    }
+                )
                 recordingSession = session
                 isRunning = true
                 updateStatusMessage(title: "VoiceShot started", message: "Recording speech")
