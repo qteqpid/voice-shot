@@ -459,10 +459,16 @@ final class RecordingSession {
 final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
     private let textView = NSTextView()
     private let scrollView = NSScrollView()
+    private let copyButton = NSButton()
+    private let titlebarAccessoryController = NSTitlebarAccessoryViewController()
     private let timeFormatter: DateFormatter
     private var pendingStartedAt: Date?
     private var pendingDotCount = 0
     private var pendingTimer: Timer?
+    private var canClose = false
+    private var didSaveOnClose = false
+    var onSaveAndClose: ((String) -> Bool)?
+    var onDidClose: (() -> Void)?
 
     init() {
         timeFormatter = DateFormatter()
@@ -470,7 +476,7 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
 
         let panel = NSPanel(
             contentRect: AppSettings.transcriptPanelFrame ?? NSRect(x: 0, y: 0, width: 520, height: 260),
-            styleMask: [.titled, .resizable],
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -480,12 +486,13 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
-        panel.becomesKeyOnlyIfNeeded = true
         panel.minSize = NSSize(width: 360, height: 180)
 
         super.init(window: panel)
         panel.delegate = self
+        panel.standardWindowButton(.closeButton)?.isEnabled = false
         buildUI()
+        buildTitlebarControls()
     }
 
     required init?(coder: NSCoder) {
@@ -529,13 +536,47 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
     }
 
     override func close() {
+        guard canClose else { return }
+        guard saveBeforeClosingIfNeeded() else { return }
         stopPendingAnimation()
         super.close()
+    }
+
+    func enableCloseForSaving() {
+        removePendingIfNeeded()
+        canClose = true
+        window?.standardWindowButton(.closeButton)?.isEnabled = true
+    }
+
+    @discardableResult
+    func closeForSaving() -> Bool {
+        enableCloseForSaving()
+        close()
+        return didSaveOnClose
+    }
+
+    func closeWithoutSaving() {
+        canClose = true
+        onSaveAndClose = nil
+        onDidClose = nil
+        close()
     }
 
     func transcriptTextForSaving() -> String {
         removePendingIfNeeded()
         return textView.string
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard canClose else { return false }
+        return saveBeforeClosingIfNeeded()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        stopPendingAnimation()
+        onDidClose?()
+        onSaveAndClose = nil
+        onDidClose = nil
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -578,6 +619,43 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
             scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
         ])
+    }
+
+    private func buildTitlebarControls() {
+        guard let window else { return }
+
+        copyButton.frame = NSRect(x: 4, y: 2, width: 30, height: 24)
+        copyButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy transcript")
+        copyButton.imagePosition = .imageOnly
+        copyButton.bezelStyle = .rounded
+        copyButton.setButtonType(.momentaryPushIn)
+        copyButton.toolTip = "Copy transcript"
+        copyButton.target = self
+        copyButton.action = #selector(copyTranscript)
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 38, height: 28))
+        container.addSubview(copyButton)
+
+        titlebarAccessoryController.view = container
+        titlebarAccessoryController.layoutAttribute = .right
+        window.addTitlebarAccessoryViewController(titlebarAccessoryController)
+    }
+
+    @objc private func copyTranscript() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(transcriptTextForSaving(), forType: .string)
+    }
+
+    private func saveBeforeClosingIfNeeded() -> Bool {
+        guard !didSaveOnClose else { return true }
+
+        didSaveOnClose = true
+        let shouldClose = onSaveAndClose?(transcriptTextForSaving()) ?? true
+        if !shouldClose {
+            didSaveOnClose = false
+        }
+        return shouldClose
     }
 
     private func positionBelowMenuBar(near statusItem: NSStatusItem?) {
@@ -751,6 +829,7 @@ final class SettingsWindowController: NSWindowController {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var recordingSession: RecordingSession?
+    private var pendingTranscriptSession: RecordingSession?
     private var settingsController: SettingsWindowController?
     private var transcriptOverlay: TranscriptOverlayController?
     private var isRunning = false
@@ -781,12 +860,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        menu.addItem(NSMenuItem(title: isRunning ? "VoiceShot: Recording" : "VoiceShot: Idle", action: nil, keyEquivalent: ""))
+        let statusTitle: String
+        if isRunning {
+            statusTitle = "VoiceShot: Recording"
+        } else if pendingTranscriptSession != nil {
+            statusTitle = "VoiceShot: Transcript Open"
+        } else {
+            statusTitle = "VoiceShot: Idle"
+        }
+        menu.addItem(NSMenuItem(title: statusTitle, action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         addPermissionRow(to: menu, title: "Microphone", granted: PermissionManager.isMicrophoneGranted(), action: #selector(openMicrophoneSettings))
         menu.addItem(.separator())
         let startItem = NSMenuItem(title: "Start Recording", action: #selector(start), keyEquivalent: "s")
-        startItem.isEnabled = !isRunning
+        startItem.isEnabled = !isRunning && pendingTranscriptSession == nil
         menu.addItem(startItem)
 
         let stopItem = NSMenuItem(title: "Stop Recording", action: #selector(finish), keyEquivalent: "f")
@@ -842,8 +929,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func start() {
-        guard recordingSession == nil else {
-            showAlert(title: "Already running", message: "Finish the current session before starting a new one.")
+        guard recordingSession == nil, pendingTranscriptSession == nil else {
+            showAlert(title: "Transcript still open", message: "Close the transcript window to save it before starting a new recording.")
             return
         }
 
@@ -859,6 +946,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let overlay = TranscriptOverlayController()
                 overlay.clear()
                 overlay.show(near: statusItem)
+                overlay.onSaveAndClose = { [weak self, weak session] text in
+                    guard let self, let session else { return true }
+                    do {
+                        let fileURL = try session.saveTranscript(text)
+                        self.updateStatusMessage(title: "VoiceShot saved", message: "Saved to \(fileURL.path)")
+                        return true
+                    } catch {
+                        self.showAlert(title: "Save failed", message: error.localizedDescription)
+                        return false
+                    }
+                }
+                overlay.onDidClose = { [weak self, weak overlay, weak session] in
+                    guard let self else { return }
+                    if self.transcriptOverlay === overlay {
+                        self.transcriptOverlay = nil
+                    }
+                    if let session {
+                        if self.recordingSession === session {
+                            self.recordingSession = nil
+                        }
+                        if self.pendingTranscriptSession === session {
+                            self.pendingTranscriptSession = nil
+                        }
+                    }
+                    self.isRunning = false
+                    self.buildMenu()
+                }
                 transcriptOverlay = overlay
 
                 try await session.start(
@@ -877,7 +991,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 updateStatusMessage(title: "VoiceShot started", message: "Recording speech")
                 buildMenu()
             } catch {
-                transcriptOverlay?.close()
+                transcriptOverlay?.closeWithoutSaving()
                 transcriptOverlay = nil
                 showAlert(title: "Failed to start", message: error.localizedDescription)
             }
@@ -889,18 +1003,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let overlay = transcriptOverlay
         Task {
             await recordingSession.stop()
-            let transcriptText = overlay?.transcriptTextForSaving() ?? ""
-            do {
-                let fileURL = try recordingSession.saveTranscript(transcriptText)
-                updateStatusMessage(title: "VoiceShot finished", message: "Saved to \(fileURL.path)")
-            } catch {
-                showAlert(title: "Save failed", message: error.localizedDescription)
-            }
             self.recordingSession = nil
-            transcriptOverlay?.close()
-            transcriptOverlay = nil
-            isRunning = false
-            buildMenu()
+            self.pendingTranscriptSession = recordingSession
+            overlay?.enableCloseForSaving()
+            self.isRunning = false
+            self.updateStatusMessage(title: "VoiceShot stopped", message: "Close transcript window to save")
+            self.buildMenu()
         }
     }
 
@@ -920,8 +1028,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             if let recordingSession {
                 await recordingSession.stop()
+                self.pendingTranscriptSession = recordingSession
+                self.recordingSession = nil
+                transcriptOverlay?.enableCloseForSaving()
             }
-            transcriptOverlay?.close()
+            if transcriptOverlay?.closeForSaving() == false {
+                return
+            }
             NSApp.terminate(nil)
         }
     }
