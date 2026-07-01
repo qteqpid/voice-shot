@@ -14,6 +14,7 @@
 		10VS00010000000000000005 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 10VS00100000000000000007 /* CoreGraphics.framework */; };
 		10VS00010000000000000006 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 10VS00100000000000000008 /* CoreMedia.framework */; };
 		10VS00010000000000000007 /* Speech.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 10VS00100000000000000009 /* Speech.framework */; };
+		10VS00010000000000000008 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 10VS01100000000000000001 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -39,6 +40,7 @@
 				10VS00010000000000000005 /* CoreGraphics.framework in Frameworks */,
 				10VS00010000000000000006 /* CoreMedia.framework in Frameworks */,
 				10VS00010000000000000007 /* Speech.framework in Frameworks */,
+				10VS00010000000000000008 /* FluidAudio in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -117,6 +119,9 @@
 			dependencies = (
 			);
 			name = VoiceShot;
+			packageProductDependencies = (
+				10VS01100000000000000001 /* FluidAudio */,
+			);
 			productName = VoiceShot;
 			productReference = 10VS00100000000000000010 /* VoiceShot.app */;
 			productType = "com.apple.product-type.application";
@@ -145,6 +150,9 @@
 				Base,
 			);
 			mainGroup = 10VS00300000000000000001;
+			packageReferences = (
+				10VS01000000000000000001 /* XCRemoteSwiftPackageReference "FluidAudio" */,
+			);
 			productRefGroup = 10VS00300000000000000006 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -175,6 +183,25 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		10VS01000000000000000001 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio";
+			requirement = {
+				branch = main;
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		10VS01100000000000000001 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 10VS01000000000000000001 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		10VS00900000000000000001 /* Debug */ = {

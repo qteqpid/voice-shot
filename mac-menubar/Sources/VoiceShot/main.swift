@@ -1,6 +1,7 @@
 import AppKit
 @preconcurrency import AVFoundation
 import CoreMedia
+@preconcurrency import FluidAudio
 import Speech
 
 struct AppSettings {
@@ -126,6 +127,10 @@ final class TranscriptWriter {
         saveURL.appendingPathComponent("transcript-\(fileNameFormatter.string(from: sessionStartedAt)).txt")
     }
 
+    func recordingURL(for sessionStartedAt: Date) -> URL {
+        saveURL.appendingPathComponent("recording-\(fileNameFormatter.string(from: sessionStartedAt)).caf")
+    }
+
     private func ensureFileExists(at fileURL: URL) {
         if !FileManager.default.fileExists(atPath: fileURL.path) {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
@@ -145,22 +150,36 @@ final class TranscriptWriter {
     }
 }
 
+struct TranscriptSegment: Sendable {
+    let startedAt: Date
+    let audioOffset: TimeInterval
+    let audioEndOffset: TimeInterval
+    let text: String
+}
+
+struct TranscriptUpdate: Sendable {
+    let segment: TranscriptSegment
+    let replacesPreviousLine: Bool
+}
+
 @MainActor
 final class NativeSpeechTranscriber {
     private var captureSession: AVCaptureSession?
     private var captureDelegate: AudioCaptureDelegate?
+    private var audioWriter: AudioFileWriter?
     private var analyzer: SpeechAnalyzer?
     private var transcriber: SpeechTranscriber?
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
     private var resultTask: Task<Void, Never>?
     private var sessionStartedAt = Date()
-    private var onText: ((Date, String, Bool) -> Void)?
+    private var onText: ((Date, TimeInterval, TimeInterval, String, Bool) -> Void)?
     private var onVoiceActivity: ((Date) -> Void)?
 
     func start(
         language: String,
+        audioFileURL: URL,
         onVoiceActivity: @escaping (Date) -> Void,
-        onText: @escaping (Date, String, Bool) -> Void
+        onText: @escaping (Date, TimeInterval, TimeInterval, String, Bool) -> Void
     ) async throws {
         await stop()
 
@@ -192,6 +211,8 @@ final class NativeSpeechTranscriber {
             throw VoiceShotError.analyzerFormatUnavailable
         }
         try? await analyzer.prepareToAnalyze(in: analyzerFormat)
+        let audioWriter = try AudioFileWriter(fileURL: audioFileURL, format: analyzerFormat)
+        self.audioWriter = audioWriter
 
         let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
         self.inputBuilder = inputBuilder
@@ -204,20 +225,24 @@ final class NativeSpeechTranscriber {
                     let text = self.bestText(from: result, recognitionMode: recognitionMode)
                     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                     let offset = self.startOffset(from: result.text)
-                    self.onText?(self.sessionStartedAt.addingTimeInterval(offset), text, result.isFinal)
+                    let endOffset = self.endOffset(from: result.text)
+                    self.onText?(self.sessionStartedAt.addingTimeInterval(offset), offset, endOffset, text, result.isFinal)
                 }
             } catch {
                 NSLog("VoiceShot speech result stream error: \(error)")
             }
         }
 
-        try startAudioCapture(analyzerFormat: analyzerFormat, inputBuilder: inputBuilder)
+        try startAudioCapture(analyzerFormat: analyzerFormat, inputBuilder: inputBuilder, audioWriter: audioWriter)
     }
 
     func stop() async {
         captureSession?.stopRunning()
+        let writer = audioWriter
         captureSession = nil
         captureDelegate = nil
+        writer?.finish()
+        audioWriter = nil
 
         inputBuilder?.finish()
         inputBuilder = nil
@@ -238,7 +263,8 @@ final class NativeSpeechTranscriber {
 
     private func startAudioCapture(
         analyzerFormat: AVAudioFormat,
-        inputBuilder: AsyncStream<AnalyzerInput>.Continuation
+        inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
+        audioWriter: AudioFileWriter
     ) throws {
         guard let audioDevice = AVCaptureDevice.default(for: .audio) else {
             throw VoiceShotError.noAudioDevice
@@ -255,6 +281,7 @@ final class NativeSpeechTranscriber {
         let delegate = AudioCaptureDelegate(
             inputBuilder: inputBuilder,
             analyzerFormat: analyzerFormat,
+            audioWriter: audioWriter,
             onVoiceActivity: { [weak self] startedAt in
                 Task { @MainActor [weak self] in
                     self?.onVoiceActivity?(startedAt)
@@ -282,6 +309,21 @@ final class NativeSpeechTranscriber {
         }
 
         return 0
+    }
+
+    private func endOffset(from attributedText: AttributedString) -> TimeInterval {
+        typealias ConfidenceKey = AttributeScopes.SpeechAttributes.ConfidenceAttribute
+        typealias TimeKey = AttributeScopes.SpeechAttributes.TimeRangeAttribute
+
+        var latestEnd: TimeInterval = 0
+        for (_, timeRange, range) in attributedText.runs[ConfidenceKey.self, TimeKey.self] {
+            let wordText = String(attributedText[range].characters)
+            guard !wordText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            guard let timeRange else { continue }
+            latestEnd = max(latestEnd, CMTimeRangeGetEnd(timeRange).seconds)
+        }
+
+        return latestEnd
     }
 
     private func bestText(from result: SpeechTranscriber.Result, recognitionMode: SpeechRecognitionMode) -> String {
@@ -403,6 +445,7 @@ enum SpeechLocale {
 final class AudioCaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     private let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
     private let analyzerFormat: AVAudioFormat
+    private let audioWriter: AudioFileWriter
     private let onVoiceActivity: @Sendable (Date) -> Void
     private var converter: AVAudioConverter?
     private var lastVoiceActivityAt = Date.distantPast
@@ -410,10 +453,12 @@ final class AudioCaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBuffer
     init(
         inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
         analyzerFormat: AVAudioFormat,
+        audioWriter: AudioFileWriter,
         onVoiceActivity: @escaping @Sendable (Date) -> Void
     ) {
         self.inputBuilder = inputBuilder
         self.analyzerFormat = analyzerFormat
+        self.audioWriter = audioWriter
         self.onVoiceActivity = onVoiceActivity
         super.init()
     }
@@ -438,6 +483,7 @@ final class AudioCaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBuffer
             outputBuffer = pcmBuffer
         }
 
+        audioWriter.write(outputBuffer)
         inputBuilder.yield(AnalyzerInput(buffer: outputBuffer))
     }
 
@@ -521,6 +567,58 @@ final class ConversionState: @unchecked Sendable {
     var consumed = false
 }
 
+final class AudioFileWriter: @unchecked Sendable {
+    private let audioFile: AVAudioFile
+    private let writeQueue = DispatchQueue(label: "com.qteqpid.VoiceShot.audio-file-writer")
+
+    init(fileURL: URL, format: AVAudioFormat) throws {
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        audioFile = try AVAudioFile(
+            forWriting: fileURL,
+            settings: format.settings,
+            commonFormat: format.commonFormat,
+            interleaved: format.isInterleaved
+        )
+    }
+
+    func write(_ buffer: AVAudioPCMBuffer) {
+        guard let copy = copyBuffer(buffer) else { return }
+        writeQueue.async { [audioFile] in
+            do {
+                try audioFile.write(from: copy)
+            } catch {
+                NSLog("VoiceShot audio write error: \(error)")
+            }
+        }
+    }
+
+    func finish() {
+        writeQueue.sync {}
+    }
+
+    private func copyBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
+            return nil
+        }
+
+        copy.frameLength = buffer.frameLength
+        let sourceBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: buffer.audioBufferList))
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+
+        for index in 0..<min(sourceBuffers.count, destinationBuffers.count) {
+            let source = sourceBuffers[index]
+            guard let sourceData = source.mData, let destinationData = destinationBuffers[index].mData else {
+                continue
+            }
+
+            destinationBuffers[index].mDataByteSize = source.mDataByteSize
+            memcpy(destinationData, sourceData, Int(source.mDataByteSize))
+        }
+
+        return copy
+    }
+}
+
 extension CMSampleBuffer {
     func toPCMBuffer() -> AVAudioPCMBuffer? {
         guard let formatDescription = CMSampleBufferGetFormatDescription(self),
@@ -545,29 +643,218 @@ extension CMSampleBuffer {
     }
 }
 
+actor FluidAudioSpeakerModelStore {
+    static let shared = FluidAudioSpeakerModelStore()
+
+    private var loadedModels: DiarizerModels?
+    private var loadingTask: Task<DiarizerModels, Error>?
+
+    func models(progressHandler: DownloadUtils.ProgressHandler? = nil) async throws -> DiarizerModels {
+        if let loadedModels {
+            return loadedModels
+        }
+
+        if let loadingTask {
+            return try await loadingTask.value
+        }
+
+        let task = Task {
+            try await DiarizerModels.downloadIfNeeded { progress in
+                NSLog("VoiceShot FluidAudio model download: \(Int(progress.fractionCompleted * 100))%%")
+                progressHandler?(progress)
+            }
+        }
+        loadingTask = task
+
+        do {
+            let models = try await task.value
+            loadedModels = models
+            loadingTask = nil
+            return models
+        } catch {
+            loadingTask = nil
+            throw error
+        }
+    }
+
+    func readyModels() -> DiarizerModels? {
+        loadedModels
+    }
+}
+
+final class FluidAudioSpeakerDiarizer {
+    private static let sampleRate = 16_000
+
+    static func prepareModels(progressHandler: DownloadUtils.ProgressHandler? = nil) async throws {
+        _ = try await FluidAudioSpeakerModelStore.shared.models(progressHandler: progressHandler)
+    }
+
+    func annotatedTranscript(for segments: [TranscriptSegment], audioURL: URL, models: DiarizerModels) async throws -> String {
+        let labels = try await speakerLabels(for: segments, audioURL: audioURL, models: models)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+
+        return zip(segments, labels)
+            .map { segment, label in
+                "\(formatter.string(from: segment.startedAt)) [\(label)] \(segment.text.trimmingCharacters(in: .whitespacesAndNewlines))\n"
+            }
+            .joined()
+    }
+
+    private func speakerLabels(for segments: [TranscriptSegment], audioURL: URL, models: DiarizerModels) async throws -> [String] {
+        guard segments.count > 1 else {
+            return Array(repeating: "A", count: segments.count)
+        }
+
+        let samples = try Self.diarizationSamples(from: audioURL)
+        let audioDuration = Double(samples.count) / Double(Self.sampleRate)
+        guard audioDuration >= 2 else {
+            return Array(repeating: "A", count: segments.count)
+        }
+
+        let diarizer = DiarizerManager(config: DiarizerConfig())
+        diarizer.initialize(models: models)
+        let result = try diarizer.performCompleteDiarization(samples, sampleRate: Self.sampleRate)
+        return Self.labels(for: segments, diarization: result.segments)
+    }
+
+    private static func diarizationSamples(from audioURL: URL) throws -> [Float] {
+        let audioFile = try AVAudioFile(forReading: audioURL)
+        let sourceFormat = audioFile.processingFormat
+        let frameCount = AVAudioFrameCount(audioFile.length)
+        guard frameCount > 0,
+              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount) else {
+            return []
+        }
+
+        try audioFile.read(into: sourceBuffer)
+        let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: Double(sampleRate),
+            channels: 1,
+            interleaved: false
+        )!
+
+        if sourceFormat.sampleRate == targetFormat.sampleRate,
+           sourceFormat.commonFormat == targetFormat.commonFormat,
+           sourceFormat.channelCount == targetFormat.channelCount,
+           let floatData = sourceBuffer.floatChannelData {
+            return Array(UnsafeBufferPointer(start: floatData[0], count: Int(sourceBuffer.frameLength)))
+        }
+
+        guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            return []
+        }
+
+        let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+        let capacity = AVAudioFrameCount(Double(sourceBuffer.frameLength) * ratio) + 1
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
+            return []
+        }
+
+        var error: NSError?
+        let state = ConversionState()
+        converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            if state.consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            state.consumed = true
+            outStatus.pointee = .haveData
+            return sourceBuffer
+        }
+
+        if let error {
+            throw error
+        }
+
+        guard let floatData = outputBuffer.floatChannelData else {
+            return []
+        }
+        return Array(UnsafeBufferPointer(start: floatData[0], count: Int(outputBuffer.frameLength)))
+    }
+
+    private static func labels(for segments: [TranscriptSegment], diarization: [TimedSpeakerSegment]) -> [String] {
+        guard !diarization.isEmpty else {
+            return Array(repeating: "A", count: segments.count)
+        }
+
+        var labelBySpeakerID: [String: String] = [:]
+        var nextLabelScalar = 65
+
+        return segments.map { segment in
+            let speakerID = bestSpeakerID(for: segment, diarization: diarization)
+            guard let speakerID else { return "A" }
+
+            if let label = labelBySpeakerID[speakerID] {
+                return label
+            }
+
+            let label = String(UnicodeScalar(nextLabelScalar) ?? "A")
+            labelBySpeakerID[speakerID] = label
+            nextLabelScalar += 1
+            return label
+        }
+    }
+
+    private static func bestSpeakerID(for segment: TranscriptSegment, diarization: [TimedSpeakerSegment]) -> String? {
+        let segmentStart = segment.audioOffset
+        let segmentEnd = max(segment.audioEndOffset, segmentStart)
+        var bestSpeakerID: String?
+        var bestOverlap: TimeInterval = 0
+
+        for diarizedSegment in diarization {
+            let diarizedStart = TimeInterval(diarizedSegment.startTimeSeconds)
+            let diarizedEnd = TimeInterval(diarizedSegment.endTimeSeconds)
+            let overlapStart = max(segmentStart, diarizedStart)
+            let overlapEnd = min(segmentEnd, diarizedEnd)
+            let overlap = max(0, overlapEnd - overlapStart)
+
+            if overlap > bestOverlap {
+                bestOverlap = overlap
+                bestSpeakerID = diarizedSegment.speakerId
+            }
+        }
+
+        return bestSpeakerID
+    }
+}
+
 @MainActor
 final class RecordingSession {
     private let transcriptWriter: TranscriptWriter
     private let transcriber = NativeSpeechTranscriber()
     private let startedAt = Date()
+    private let audioURL: URL
+    private var transcriptSegments: [TranscriptSegment] = []
 
     init(saveURL: URL) throws {
         transcriptWriter = try TranscriptWriter(saveURL: saveURL)
+        audioURL = transcriptWriter.recordingURL(for: startedAt)
     }
 
     func start(
         onVoiceActivity: ((Date) -> Void)? = nil,
         onPartialText: ((Date, String) -> Void)? = nil,
-        onFinalText: ((Date, String) -> Void)? = nil
+        onFinalText: ((Date, String, Bool) -> Void)? = nil
     ) async throws {
         try await transcriber.start(
             language: AppSettings.language,
+            audioFileURL: audioURL,
             onVoiceActivity: { startedAt in
                 onVoiceActivity?(startedAt)
             },
-            onText: { startedAt, text, isFinal in
+            onText: { [weak self] startedAt, audioOffset, audioEndOffset, text, isFinal in
                 if isFinal {
-                    onFinalText?(startedAt, text)
+                    let update = self?.appendOrMergeFinalSegment(
+                        startedAt: startedAt,
+                        audioOffset: audioOffset,
+                        audioEndOffset: audioEndOffset,
+                        text: text
+                    )
+                    if let update {
+                        onFinalText?(update.segment.startedAt, update.segment.text, update.replacesPreviousLine)
+                    }
                 } else {
                     onPartialText?(startedAt, text)
                 }
@@ -582,6 +869,116 @@ final class RecordingSession {
     func saveTranscript(_ text: String) throws -> URL {
         try transcriptWriter.saveTranscript(for: startedAt, text: text)
     }
+
+    func speakerLabeledTranscript() async throws -> String? {
+        guard transcriptSegments.count > 1, FileManager.default.fileExists(atPath: audioURL.path) else {
+            return nil
+        }
+
+        let segments = transcriptSegments
+        let recordingURL = audioURL
+        guard let models = await FluidAudioSpeakerModelStore.shared.readyModels() else {
+            return nil
+        }
+
+        return try await FluidAudioSpeakerDiarizer().annotatedTranscript(for: segments, audioURL: recordingURL, models: models)
+    }
+
+    private func appendOrMergeFinalSegment(
+        startedAt: Date,
+        audioOffset: TimeInterval,
+        audioEndOffset: TimeInterval,
+        text: String
+    ) -> TranscriptUpdate {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newSegment = TranscriptSegment(
+            startedAt: startedAt,
+            audioOffset: audioOffset,
+            audioEndOffset: max(audioOffset, audioEndOffset),
+            text: trimmed
+        )
+
+        guard let previous = transcriptSegments.last,
+              shouldMerge(previous: previous, next: newSegment) else {
+            transcriptSegments.append(newSegment)
+            return TranscriptUpdate(segment: newSegment, replacesPreviousLine: false)
+        }
+
+        let mergedSegment = TranscriptSegment(
+            startedAt: previous.startedAt,
+            audioOffset: previous.audioOffset,
+            audioEndOffset: max(previous.audioEndOffset, newSegment.audioEndOffset),
+            text: mergedText(previous.text, trimmed)
+        )
+        transcriptSegments[transcriptSegments.count - 1] = mergedSegment
+        return TranscriptUpdate(segment: mergedSegment, replacesPreviousLine: true)
+    }
+
+    private func shouldMerge(previous: TranscriptSegment, next: TranscriptSegment) -> Bool {
+        guard !previous.text.isEmpty, !next.text.isEmpty else { return false }
+        guard !endsSentence(previous.text) else { return false }
+
+        let gap = next.audioOffset - previous.audioEndOffset
+        return gap >= -0.4 && gap < 2.5
+    }
+
+    private func endsSentence(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.last else {
+            return false
+        }
+        return ".。!?！？".unicodeScalars.contains(last)
+    }
+
+    private func mergedText(_ previous: String, _ next: String) -> String {
+        let left = previous.trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = next.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !left.isEmpty else { return right }
+        guard !right.isEmpty else { return left }
+
+        guard let leftLast = left.unicodeScalars.last, let rightFirst = right.unicodeScalars.first else {
+            return left + right
+        }
+
+        if isClosingPunctuation(rightFirst)
+            || (isCJK(leftLast) && isCJK(rightFirst))
+            || (isLatin(leftLast) && isCJK(rightFirst)) {
+            return left + right
+        }
+
+        if isCJK(leftLast) && isLatin(rightFirst) {
+            return left + " " + right
+        }
+
+        if isLatin(leftLast) && isLatin(rightFirst) {
+            return left + " " + right
+        }
+
+        return left + right
+    }
+
+    private func isLatin(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.value {
+        case 0x0041...0x005A, 0x0061...0x007A, 0x0030...0x0039, 0x0027:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func isCJK(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.value {
+        case 0x4E00...0x9FFF, 0x3400...0x4DBF, 0x20000...0x2A6DF,
+             0x3040...0x30FF, 0xAC00...0xD7AF:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func isClosingPunctuation(_ scalar: UnicodeScalar) -> Bool {
+        ".,，。!?！？;；:：)]}）】」』".unicodeScalars.contains(scalar)
+    }
+
 }
 
 @MainActor
@@ -658,10 +1055,25 @@ final class TranscriptOverlayController: NSWindowController, NSWindowDelegate {
         textView.scrollToEndOfDocument(nil)
     }
 
+    func replaceLastLine(startedAt: Date, text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        removePendingIfNeeded()
+        removeLastLine()
+        append(startedAt: startedAt, text: trimmed)
+    }
+
     func clear() {
         textView.string = ""
         stopPendingAnimation()
         pendingStartedAt = nil
+    }
+
+    func replaceTranscript(with text: String) {
+        removePendingIfNeeded()
+        textView.string = text
+        textView.scrollToEndOfDocument(nil)
     }
 
     override func close() {
@@ -960,16 +1372,35 @@ final class SettingsWindowController: NSWindowController {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private enum SpeakerModelState {
+        case preparing
+        case ready
+        case failed(String)
+
+        var menuTitle: String {
+            switch self {
+            case .preparing:
+                return "Speaker Model: Preparing"
+            case .ready:
+                return "Speaker Model: Ready"
+            case .failed:
+                return "Speaker Model: Unavailable"
+            }
+        }
+    }
+
     private var statusItem: NSStatusItem?
     private var recordingSession: RecordingSession?
     private var pendingTranscriptSession: RecordingSession?
     private var settingsController: SettingsWindowController?
     private var transcriptOverlay: TranscriptOverlayController?
     private var isRunning = false
+    private var speakerModelState: SpeakerModelState = .preparing
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         buildMenu()
+        prepareSpeakerModelInBackground()
     }
 
     nonisolated func menuWillOpen(_ menu: NSMenu) {
@@ -1004,6 +1435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: statusTitle, action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         addPermissionRow(to: menu, title: "Microphone", granted: PermissionManager.isMicrophoneGranted(), action: #selector(openMicrophoneSettings))
+        addSpeakerModelRow(to: menu)
         menu.addItem(.separator())
         let startItem = NSMenuItem(title: "Start Recording", action: #selector(start), keyEquivalent: "s")
         startItem.isEnabled = !isRunning && pendingTranscriptSession == nil
@@ -1061,6 +1493,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item)
     }
 
+    private func addSpeakerModelRow(to menu: NSMenu) {
+        let item = NSMenuItem(title: speakerModelState.menuTitle, action: nil, keyEquivalent: "")
+        switch speakerModelState {
+        case .failed(let message):
+            item.toolTip = "Speaker labels will be skipped. \(message)"
+        case .preparing:
+            item.toolTip = "VoiceShot is preparing the speaker-label model in the background."
+        case .ready:
+            item.toolTip = "Speaker labels will be added after recording stops."
+        }
+        menu.addItem(item)
+    }
+
+    private func prepareSpeakerModelInBackground() {
+        speakerModelState = .preparing
+        Task { [weak self] in
+            do {
+                try await FluidAudioSpeakerDiarizer.prepareModels()
+                await MainActor.run {
+                    self?.speakerModelState = .ready
+                    self?.buildMenu()
+                }
+            } catch {
+                NSLog("VoiceShot speaker model preparation failed: \(error)")
+                await MainActor.run {
+                    self?.speakerModelState = .failed(error.localizedDescription)
+                    self?.updateStatusMessage(title: "VoiceShot", message: "Speaker labels unavailable")
+                    self?.buildMenu()
+                }
+            }
+        }
+    }
+
     @objc private func start() {
         guard recordingSession == nil, pendingTranscriptSession == nil else {
             showAlert(title: "Transcript still open", message: "Close the transcript window to save it before starting a new recording.")
@@ -1115,8 +1580,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     onPartialText: { [weak overlay] startedAt, text in
                         overlay?.showPending(startedAt: startedAt)
                     },
-                    onFinalText: { [weak overlay] startedAt, text in
-                        overlay?.append(startedAt: startedAt, text: text)
+                    onFinalText: { [weak overlay] startedAt, text, replacesPreviousLine in
+                        if replacesPreviousLine {
+                            overlay?.replaceLastLine(startedAt: startedAt, text: text)
+                        } else {
+                            overlay?.append(startedAt: startedAt, text: text)
+                        }
                     }
                 )
                 recordingSession = session
@@ -1136,11 +1605,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let overlay = transcriptOverlay
         Task {
             await recordingSession.stop()
+            var completionMessage = "Close transcript window to save"
+
+            switch speakerModelState {
+            case .ready:
+                self.updateStatusMessage(title: "VoiceShot stopped", message: "Identifying speakers")
+                do {
+                    if let speakerLabeledTranscript = try await recordingSession.speakerLabeledTranscript() {
+                        overlay?.replaceTranscript(with: speakerLabeledTranscript)
+                    }
+                } catch {
+                    NSLog("VoiceShot speaker diarization failed: \(error)")
+                    completionMessage = "Speaker labels skipped; close transcript window to save"
+                }
+            case .preparing:
+                completionMessage = "Speaker model still preparing; close transcript window to save"
+            case .failed:
+                completionMessage = "Speaker labels unavailable; close transcript window to save"
+            }
+
             self.recordingSession = nil
             self.pendingTranscriptSession = recordingSession
             overlay?.enableCloseForSaving()
             self.isRunning = false
-            self.updateStatusMessage(title: "VoiceShot stopped", message: "Close transcript window to save")
+            self.updateStatusMessage(title: "VoiceShot stopped", message: completionMessage)
             self.buildMenu()
         }
     }
@@ -1161,6 +1649,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             if let recordingSession {
                 await recordingSession.stop()
+                if case .ready = speakerModelState {
+                    do {
+                        if let speakerLabeledTranscript = try await recordingSession.speakerLabeledTranscript() {
+                            transcriptOverlay?.replaceTranscript(with: speakerLabeledTranscript)
+                        }
+                    } catch {
+                        NSLog("VoiceShot speaker diarization failed: \(error)")
+                    }
+                }
                 self.pendingTranscriptSession = recordingSession
                 self.recordingSession = nil
                 transcriptOverlay?.enableCloseForSaving()

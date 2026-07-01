@@ -10,9 +10,15 @@ let package = Package(
     products: [
         .executable(name: "VoiceShot", targets: ["VoiceShot"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/FluidInference/FluidAudio", branch: "main")
+    ],
     targets: [
         .executableTarget(
             name: "VoiceShot",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio")
+            ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("AVFoundation"),
