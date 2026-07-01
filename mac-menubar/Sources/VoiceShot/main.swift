@@ -44,6 +44,56 @@ struct AppSettings {
     }
 }
 
+struct SpeechRecognitionMode {
+    let primaryLocaleIdentifier: String
+
+    var storageValue: String { primaryLocaleIdentifier }
+    var title: String { primaryLocaleIdentifier }
+    var isMixedWithEnglish: Bool { !primaryLocaleIdentifier.lowercased().hasPrefix("en") }
+
+    static let all: [SpeechRecognitionMode] = [
+        SpeechRecognitionMode(primaryLocaleIdentifier: "zh-CN"),
+        SpeechRecognitionMode(primaryLocaleIdentifier: "en-US"),
+        SpeechRecognitionMode(primaryLocaleIdentifier: "ja-JP"),
+        SpeechRecognitionMode(primaryLocaleIdentifier: "ko-KR")
+    ]
+
+    static func mode(for storageValue: String) -> SpeechRecognitionMode {
+        let primaryIdentifier = storageValue.components(separatedBy: "+").first ?? storageValue
+        return all.first { $0.primaryLocaleIdentifier == primaryIdentifier }
+            ?? SpeechRecognitionMode(primaryLocaleIdentifier: primaryIdentifier)
+    }
+
+    var reportingOptions: Set<SpeechTranscriber.ReportingOption> {
+        isMixedWithEnglish ? [.volatileResults, .alternativeTranscriptions] : [.volatileResults]
+    }
+
+    var attributeOptions: Set<SpeechTranscriber.ResultAttributeOption> {
+        isMixedWithEnglish ? [.audioTimeRange, .transcriptionConfidence] : [.audioTimeRange]
+    }
+
+    func makeAnalysisContext() -> AnalysisContext {
+        let context = AnalysisContext()
+        if isMixedWithEnglish {
+            context.contextualStrings[.general] = Self.mixedWithEnglishContextualStrings
+        }
+        return context
+    }
+
+    static let mixedWithEnglishContextualStrings = [
+        "Zoom", "meeting", "OK", "yes", "no", "hello", "hi", "thanks", "thank you",
+        "question", "answer", "issue", "problem", "solution", "feedback", "follow up",
+        "next step", "action item", "agenda", "timeline", "deadline", "status", "update",
+        "project", "product", "design", "engineering", "review", "decision", "proposal",
+        "document", "doc", "slide", "dashboard", "report", "data", "metric", "experiment",
+        "API", "SDK", "UI", "UX", "PR", "pull request", "branch", "release", "deploy",
+        "backend", "frontend", "server", "client", "database", "cache", "feature", "bug",
+        "test", "testing", "debug", "login", "signup", "payment", "checkout", "profile",
+        "notification", "permission", "setting", "config", "model", "prompt", "agent",
+        "transcript", "recording", "audio", "speech", "English"
+    ]
+}
+
 enum PermissionManager {
     static func isMicrophoneGranted() -> Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
@@ -114,7 +164,8 @@ final class NativeSpeechTranscriber {
     ) async throws {
         await stop()
 
-        guard let locale = await SpeechLocale.bestMatching(preferredIdentifier: language) else {
+        let recognitionMode = SpeechRecognitionMode.mode(for: language)
+        guard let locale = await SpeechLocale.bestMatching(preferredIdentifier: recognitionMode.primaryLocaleIdentifier) else {
             throw VoiceShotError.speechRecognizerUnavailable(language)
         }
 
@@ -125,8 +176,8 @@ final class NativeSpeechTranscriber {
         let transcriber = SpeechTranscriber(
             locale: locale,
             transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
-            attributeOptions: [.audioTimeRange]
+            reportingOptions: recognitionMode.reportingOptions,
+            attributeOptions: recognitionMode.attributeOptions
         )
         self.transcriber = transcriber
 
@@ -134,6 +185,7 @@ final class NativeSpeechTranscriber {
 
         let options = SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime)
         let analyzer = SpeechAnalyzer(modules: [transcriber], options: options)
+        try await analyzer.setContext(recognitionMode.makeAnalysisContext())
         self.analyzer = analyzer
 
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
@@ -149,7 +201,7 @@ final class NativeSpeechTranscriber {
             do {
                 for try await result in transcriber.results {
                     guard let self else { continue }
-                    let text = String(result.text.characters)
+                    let text = self.bestText(from: result, recognitionMode: recognitionMode)
                     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                     let offset = self.startOffset(from: result.text)
                     self.onText?(self.sessionStartedAt.addingTimeInterval(offset), text, result.isFinal)
@@ -230,6 +282,83 @@ final class NativeSpeechTranscriber {
         }
 
         return 0
+    }
+
+    private func bestText(from result: SpeechTranscriber.Result, recognitionMode: SpeechRecognitionMode) -> String {
+        guard recognitionMode.isMixedWithEnglish, !result.alternatives.isEmpty else {
+            return String(result.text.characters)
+        }
+
+        let candidates = [result.text] + result.alternatives
+        let bestCandidate = candidates.max { first, second in
+            mixedWithEnglishScore(for: first) < mixedWithEnglishScore(for: second)
+        } ?? result.text
+        return String(bestCandidate.characters)
+    }
+
+    private func mixedWithEnglishScore(for attributedText: AttributedString) -> Double {
+        let text = String(attributedText.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return -Double.infinity }
+
+        var score = averageConfidence(for: attributedText) ?? 0.5
+        let scriptCounts = scriptCounts(in: text)
+
+        if scriptCounts.nonLatinPrimary > 0 && scriptCounts.latin > 0 {
+            score += 0.08
+        } else if scriptCounts.nonLatinPrimary == 0 && scriptCounts.latin > 0 {
+            score -= 0.04
+        }
+
+        score += min(Double(scriptCounts.latin), 24) * 0.003
+        score += min(Double(contextualHitCount(in: text)), 5) * 0.025
+        return score
+    }
+
+    private func averageConfidence(for attributedText: AttributedString) -> Double? {
+        typealias ConfidenceKey = AttributeScopes.SpeechAttributes.ConfidenceAttribute
+
+        var weightedConfidence = 0.0
+        var characterCount = 0
+
+        for (confidence, range) in attributedText.runs[ConfidenceKey.self] {
+            guard let confidence else { continue }
+            let text = String(attributedText[range].characters)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            let count = trimmed.count
+            weightedConfidence += confidence * Double(count)
+            characterCount += count
+        }
+
+        guard characterCount > 0 else { return nil }
+        return weightedConfidence / Double(characterCount)
+    }
+
+    private func scriptCounts(in text: String) -> (nonLatinPrimary: Int, latin: Int) {
+        var nonLatinPrimary = 0
+        var latin = 0
+
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x4E00...0x9FFF, 0x3400...0x4DBF, 0x20000...0x2A6DF,
+                 0x3040...0x30FF, 0xAC00...0xD7AF:
+                nonLatinPrimary += 1
+            case 0x0041...0x005A, 0x0061...0x007A:
+                latin += 1
+            default:
+                continue
+            }
+        }
+
+        return (nonLatinPrimary, latin)
+    }
+
+    private func contextualHitCount(in text: String) -> Int {
+        let normalized = text.lowercased()
+        return SpeechRecognitionMode.mixedWithEnglishContextualStrings.reduce(0) { count, term in
+            normalized.contains(term.lowercased()) ? count + 1 : count
+        }
     }
 }
 
@@ -772,8 +901,11 @@ final class SettingsWindowController: NSWindowController {
         stack.spacing = 14
         stack.alignment = .leading
 
-        languagePopup.addItems(withTitles: ["zh-CN", "en-US", "ja-JP", "ko-KR"])
-        stack.addArrangedSubview(row(label: "Speech language", control: languagePopup))
+        for mode in SpeechRecognitionMode.all {
+            languagePopup.addItem(withTitle: mode.title)
+            languagePopup.lastItem?.representedObject = mode.storageValue
+        }
+        stack.addArrangedSubview(row(label: "Primary speech language", control: languagePopup))
 
         let pathRow = NSStackView()
         pathRow.orientation = .horizontal
@@ -815,12 +947,13 @@ final class SettingsWindowController: NSWindowController {
     }
 
     private func load() {
-        languagePopup.selectItem(withTitle: AppSettings.language)
+        let mode = SpeechRecognitionMode.mode(for: AppSettings.language)
+        languagePopup.selectItem(withTitle: mode.title)
         pathField.stringValue = NSString(string: AppSettings.saveURL.path).abbreviatingWithTildeInPath
     }
 
     @objc private func save() {
-        AppSettings.language = languagePopup.titleOfSelectedItem ?? "zh-CN"
+        AppSettings.language = languagePopup.selectedItem?.representedObject as? String ?? "zh-CN"
         close()
     }
 }
